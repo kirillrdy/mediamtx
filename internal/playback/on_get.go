@@ -54,7 +54,13 @@ func seekAndMux(
 		}
 		defer f.Close()
 
-		firstInit, _, err := segmentFMP4ReadHeader(f)
+		fi, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		firstFileSize := fi.Size()
+
+		firstInit, firstTotalDuration, firstMoovEnd, err := segmentFMP4ReadHeader(f)
 		if err != nil {
 			return err
 		}
@@ -68,7 +74,7 @@ func seekAndMux(
 		dts := startOffset
 		prevInit := firstInit
 
-		segmentDuration, err := segmentFMP4MuxParts(f, dts, duration, firstInit.Tracks, m)
+		segmentDuration, err := segmentFMP4MuxParts(f, dts, duration, firstInit.Tracks, m, firstMoovEnd, firstTotalDuration, firstFileSize)
 		if err != nil {
 			return err
 		}
@@ -83,7 +89,7 @@ func seekAndMux(
 			defer f.Close()
 
 			var init *fmp4.Init
-			init, _, err = segmentFMP4ReadHeader(f)
+			init, _, _, err = segmentFMP4ReadHeader(f)
 			if err != nil {
 				return err
 			}
@@ -99,7 +105,7 @@ func seekAndMux(
 				dts = seg.Start.Sub(start) // this is positive
 			}
 
-			segmentDuration, err = segmentFMP4MuxParts(f, dts, duration, firstInit.Tracks, m)
+			segmentDuration, err = segmentFMP4MuxParts(f, dts, duration, firstInit.Tracks, m, 0, 0, 0)
 			if err != nil {
 				return err
 			}

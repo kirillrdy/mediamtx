@@ -36,7 +36,7 @@ func parseSegment(seg *recordstore.Segment) (*parsedSegment, error) {
 	}
 	defer f.Close()
 
-	init, duration, err := segmentFMP4ReadHeader(f)
+	init, duration, _, err := segmentFMP4ReadHeader(f)
 	if err != nil {
 		return nil, err
 	}
