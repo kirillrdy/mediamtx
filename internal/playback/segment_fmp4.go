@@ -108,35 +108,35 @@ func segmentFMP4CanBeConcatenated(
 	}
 }
 
-func segmentFMP4ReadHeader(r io.ReadSeeker) (*fmp4.Init, time.Duration, error) {
+func segmentFMP4ReadHeader(r io.ReadSeeker) (*fmp4.Init, time.Duration, int64, error) {
 	// check and skip ftyp
 
 	buf := make([]byte, 8)
 	_, err := io.ReadFull(r, buf)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	if !bytes.Equal(buf[4:], []byte{'f', 't', 'y', 'p'}) {
-		return nil, 0, fmt.Errorf("ftyp box not found")
+		return nil, 0, 0, fmt.Errorf("ftyp box not found")
 	}
 
 	ftypSize := uint32(buf[0])<<24 | uint32(buf[1])<<16 | uint32(buf[2])<<8 | uint32(buf[3])
 
 	_, err = r.Seek(int64(ftypSize), io.SeekStart)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	// check moov
 
 	_, err = io.ReadFull(r, buf)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	if !bytes.Equal(buf[4:], []byte{'m', 'o', 'o', 'v'}) {
-		return nil, 0, fmt.Errorf("moov box not found")
+		return nil, 0, 0, fmt.Errorf("moov box not found")
 	}
 
 	moovSize := uint32(buf[0])<<24 | uint32(buf[1])<<16 | uint32(buf[2])<<8 | uint32(buf[3])
@@ -145,7 +145,7 @@ func segmentFMP4ReadHeader(r io.ReadSeeker) (*fmp4.Init, time.Duration, error) {
 
 	_, err = r.Seek(8, io.SeekCurrent)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	// read mvhd
@@ -153,7 +153,7 @@ func segmentFMP4ReadHeader(r io.ReadSeeker) (*fmp4.Init, time.Duration, error) {
 	var mvhd amp4.Mvhd
 	_, err = amp4.Unmarshal(r, uint64(moovSize-8), &mvhd, amp4.Context{})
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	d := time.Duration(mvhd.DurationV0) * time.Second / time.Duration(mvhd.Timescale)
@@ -162,14 +162,14 @@ func segmentFMP4ReadHeader(r io.ReadSeeker) (*fmp4.Init, time.Duration, error) {
 
 	_, err = r.Seek(0, io.SeekStart)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	buf = make([]byte, uint64(ftypSize+moovSize))
 
 	_, err = io.ReadFull(r, buf)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	// pass ftyp and moov to fmp4.Init
@@ -177,10 +177,10 @@ func segmentFMP4ReadHeader(r io.ReadSeeker) (*fmp4.Init, time.Duration, error) {
 	var init fmp4.Init
 	err = init.Unmarshal(bytes.NewReader(buf))
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
-	return &init, d, nil
+	return &init, d, int64(ftypSize) + int64(moovSize), nil
 }
 
 func segmentFMP4ReadDurationFromParts(
@@ -504,17 +504,12 @@ func fmp4ReadMoofTfdt(r io.ReaderAt, bodyStart, bodyEnd int64, tracks []*fmp4.In
 	return
 }
 
-// segmentFMP4FindSkipOffset performs a lightweight scan of the fMP4 file using
-// ReadAt (which does not affect the sequential read position) to build a
-// fragment time index and find the absolute file offset of the first moof box
-// that falls within the GOP pre-roll window before startDTS. All moof boxes
-// before this offset are entirely outside the relevant time range and can be
-// skipped in the ReadBoxStructure pass without reading any sample payloads,
-// reducing seek latency from O(segment_duration) to O(gopPreroll).
-//
-// Returns 0 when no moofs can be skipped (full scan required).
-func segmentFMP4FindSkipOffset(r io.ReaderAt, startDTS time.Duration, tracks []*fmp4.InitTrack) uint64 {
-	var off int64
+// fmp4LinearScanFrom scans boxes starting at fromOffset (using ReadAt) and
+// returns the file offset of the first moof whose fragment DTS satisfies the
+// gopPreroll condition relative to startDTS. Returns 0 if no such moof is
+// found or on any read error.
+func fmp4LinearScanFrom(r io.ReaderAt, fromOffset uint64, startDTS time.Duration, tracks []*fmp4.InitTrack) uint64 {
+	off := int64(fromOffset)
 	hdr := [16]byte{}
 
 	for {
@@ -533,7 +528,7 @@ func segmentFMP4FindSkipOffset(r io.ReaderAt, startDTS time.Duration, tracks []*
 			boxSz = int64(binary.BigEndian.Uint64(hdr[8:16]))
 			hdrSz = 16
 		} else if boxSz == 0 {
-			return 0 // extends to EOF; can't determine next box offset
+			return 0
 		}
 
 		if boxSz < hdrSz {
@@ -543,8 +538,6 @@ func segmentFMP4FindSkipOffset(r io.ReaderAt, startDTS time.Duration, tracks []*
 		if boxType == "moof" {
 			baseDTS, timeScale, ok := fmp4ReadMoofTfdt(r, off+hdrSz, off+boxSz, tracks)
 			if ok {
-				// fragDTS is the time of this fragment relative to the requested start.
-				// Once it reaches -gopPreroll we have enough pre-roll for GOP alignment.
 				fragDTS := durationMp4ToGo(baseDTS, timeScale) + startDTS
 				if fragDTS >= -gopPreroll {
 					return uint64(off)
@@ -556,19 +549,127 @@ func segmentFMP4FindSkipOffset(r io.ReaderAt, startDTS time.Duration, tracks []*
 	}
 }
 
+// fmp4FindNearestMoofAfter reads a 2 MiB buffer starting at pos and returns
+// the absolute file offset of the first plausible moof box found within it.
+// Returns 0 if no moof is found.
+func fmp4FindNearestMoofAfter(r io.ReaderAt, pos int64) int64 {
+	const bufSize = 2 << 20 // 2 MiB
+	buf := make([]byte, bufSize)
+	n, _ := r.ReadAt(buf, pos)
+	if n < 8 {
+		return 0
+	}
+	buf = buf[:n]
+
+	moofMark := []byte("moof")
+	for off := 0; off+8 <= len(buf); {
+		idx := bytes.Index(buf[off:], moofMark)
+		if idx < 0 {
+			return 0
+		}
+		absIdx := off + idx
+		// The box size field is the 4 bytes immediately before "moof".
+		if absIdx >= 4 {
+			sz := binary.BigEndian.Uint32(buf[absIdx-4 : absIdx])
+			if sz >= 100 && sz <= 1_000_000 {
+				return pos + int64(absIdx-4)
+			}
+		}
+		off = absIdx + 1
+	}
+	return 0
+}
+
+// segmentFMP4FindSkipOffset returns the file offset of the first moof box that
+// falls within the GOP pre-roll window before startDTS. All moof boxes before
+// this offset are outside the relevant time range and can be skipped in the
+// ReadBoxStructure pass, reducing seek latency from O(segment_duration) to
+// O(gopPreroll).
+//
+// When moovEnd, totalDuration, and fileSize are all non-zero the function uses
+// linear interpolation to jump near the target position (O(1) I/O) and then
+// scans only a small number of fragments. If those values are unknown (zero)
+// it falls back to a linear scan from the beginning of the file.
+//
+// Returns 0 when no moofs can be skipped (full scan required).
+func segmentFMP4FindSkipOffset(
+	r io.ReaderAt,
+	startDTS time.Duration,
+	tracks []*fmp4.InitTrack,
+	moovEnd int64,
+	totalDuration time.Duration,
+	fileSize int64,
+) uint64 {
+	targetRelTime := -startDTS - gopPreroll
+	if targetRelTime <= 0 {
+		return 0
+	}
+
+	// Fast path: use linear interpolation to jump near the target position
+	// instead of scanning the whole file one fragment at a time.
+	if totalDuration > 0 && moovEnd > 0 && fileSize > moovEnd {
+		dataSize := float64(fileSize - moovEnd)
+		frac := float64(targetRelTime) / float64(totalDuration)
+		if frac < 1.0 {
+			// Back off by 2× gopPreroll worth of estimated bytes so we are
+			// guaranteed to start before the required pre-roll window even
+			// when the bitrate estimate is slightly off.
+			margin := 2.0 * float64(gopPreroll) / float64(totalDuration) * dataSize
+			safeOffset := int64(float64(moovEnd) + frac*dataSize - margin)
+			if safeOffset > moovEnd {
+				if moofOff := fmp4FindNearestMoofAfter(r, safeOffset); moofOff > 0 {
+					if skipOff := fmp4LinearScanFrom(r, uint64(moofOff), startDTS, tracks); skipOff > 0 {
+						return skipOff
+					}
+				}
+			}
+		}
+	}
+
+	// Slow path: linear scan from the beginning of the file.
+	return fmp4LinearScanFrom(r, 0, startDTS, tracks)
+}
+
+// seekInterceptor wraps a readSeekerAt and redirects the very first
+// Seek(0, io.SeekStart) call — which amp4.ReadBoxStructure always issues
+// before it starts reading — to seekTarget instead. This lets ReadBoxStructure
+// start scanning from an arbitrary moof position without traversing all the
+// preceding boxes on disk.
+type seekInterceptor struct {
+	readSeekerAt
+	seekTarget int64
+	done       bool
+}
+
+func (si *seekInterceptor) Seek(offset int64, whence int) (int64, error) {
+	if !si.done && whence == io.SeekStart && offset == 0 {
+		si.done = true
+		return si.readSeekerAt.Seek(si.seekTarget, io.SeekStart)
+	}
+	return si.readSeekerAt.Seek(offset, whence)
+}
+
 func segmentFMP4MuxParts(
 	r readSeekerAt,
 	startDTS time.Duration,
 	duration time.Duration,
 	tracks []*fmp4.InitTrack,
 	m muxer,
+	moovEnd int64,
+	totalDuration time.Duration,
+	fileSize int64,
 ) (time.Duration, error) {
-	// Fast pre-scan: find the file offset of the first moof that falls within
-	// the GOP pre-roll window. Moofs before this offset are entirely outside
-	// the relevant time range; skipping them avoids reading their sample payloads
-	// (~1.8 GB for a 1-hour segment at 4 Mbps), which is the primary cause of
-	// slow seeks on long segments.
-	skipBeforeOffset := segmentFMP4FindSkipOffset(r, startDTS, tracks)
+	skipBeforeOffset := segmentFMP4FindSkipOffset(r, startDTS, tracks, moovEnd, totalDuration, fileSize)
+
+	// amp4.ReadBoxStructure always rewinds to position 0 before scanning,
+	// so without intervention it would seek through every moof/mdat pair up
+	// to skipBeforeOffset — the same page faults we just avoided in
+	// segmentFMP4FindSkipOffset. Use seekInterceptor to redirect that initial
+	// rewind to skipBeforeOffset so the library starts reading there directly.
+	var rs io.ReadSeeker = r
+	if skipBeforeOffset > 0 {
+		rs = &seekInterceptor{readSeekerAt: r, seekTarget: int64(skipBeforeOffset)}
+	}
 
 	var startDTSMP4 int64
 	var durationMP4 int64
@@ -579,11 +680,9 @@ func segmentFMP4MuxParts(
 	var segmentDuration time.Duration
 	breakAtNextMdat := false
 
-	_, err := amp4.ReadBoxStructure(r, func(h *amp4.ReadHandle) (any, error) {
+	_, err := amp4.ReadBoxStructure(rs, func(h *amp4.ReadHandle) (any, error) {
 		switch h.BoxInfo.Type.String() {
 		case "moof":
-			// Skip moofs that are entirely before the GOP pre-roll window.
-			// ReadBoxStructure will seek past the entire moof+mdat pair cheaply.
 			if h.BoxInfo.Offset < skipBeforeOffset {
 				return nil, nil
 			}
