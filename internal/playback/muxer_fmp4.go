@@ -14,11 +14,14 @@ const (
 )
 
 type muxerFMP4Track struct {
-	id        int
-	timeScale uint32
-	firstDTS  int64
-	lastDTS   int64
-	samples   []*fmp4.Sample
+	id               int
+	timeScale        uint32
+	firstDTSSet      bool
+	firstDTS         int64
+	firstVisibleDTS  int64
+	hasVisibleSamples bool
+	lastDTS          int64
+	samples          []*fmp4.Sample
 }
 
 func findTrack(tracks []*muxerFMP4Track, id int) *muxerFMP4Track {
@@ -49,7 +52,6 @@ func (w *muxerFMP4) writeInit(init *fmp4.Init) {
 		w.tracks[i] = &muxerFMP4Track{
 			id:        track.ID,
 			timeScale: track.TimeScale,
-			firstDTS:  -1,
 		}
 	}
 }
@@ -70,53 +72,41 @@ func (w *muxerFMP4) writeSample(
 		return err
 	}
 
+	// remove GOPs before the GOP of the first visible sample
+	if (dts < 0 || (dts >= 0 && w.curTrack.lastDTS < 0)) && !isNonSyncSample {
+		w.curTrack.samples = w.curTrack.samples[:0]
+		w.curTrack.firstDTSSet = false
+		w.curTrack.hasVisibleSamples = false
+	}
+
+	if !w.curTrack.firstDTSSet {
+		w.curTrack.firstDTS = dts
+		w.curTrack.firstDTSSet = true
+	} else {
+		duration := max(dts-w.curTrack.lastDTS, 0)
+		w.curTrack.samples[len(w.curTrack.samples)-1].Duration = uint32(duration)
+	}
+
+	w.curTrack.samples = append(w.curTrack.samples, &fmp4.Sample{
+		PTSOffset:       ptsOffset,
+		IsNonSyncSample: isNonSyncSample,
+		Payload:         pl,
+	})
+	w.curTrack.lastDTS = dts
+
 	if dts >= 0 {
-		// this is the first visible sample of this track
-		if w.curTrack.firstDTS < 0 {
-			w.curTrack.firstDTS = dts
-
-			// if sample is a IDR, remove previous GOP
-			if !isNonSyncSample {
-				w.curTrack.samples = w.curTrack.samples[:0]
-			}
-		} else {
-			duration := max(dts-w.curTrack.lastDTS, 0)
-			w.curTrack.samples[len(w.curTrack.samples)-1].Duration = uint32(duration)
+		if !w.curTrack.hasVisibleSamples {
+			w.curTrack.firstVisibleDTS = dts
+			w.curTrack.hasVisibleSamples = true
 		}
-
-		w.curTrack.samples = append(w.curTrack.samples, &fmp4.Sample{
-			PTSOffset:       ptsOffset,
-			IsNonSyncSample: isNonSyncSample,
-			Payload:         pl,
-		})
-		w.curTrack.lastDTS = dts
 
 		partDurationMP4 := durationGoToMp4(partDuration, w.curTrack.timeScale)
 
-		if (w.curTrack.lastDTS - w.curTrack.firstDTS) >= partDurationMP4 {
+		if (w.curTrack.lastDTS - w.curTrack.firstVisibleDTS) >= partDurationMP4 {
 			err = w.innerFlush(false)
 			if err != nil {
 				return err
 			}
-		}
-	} else {
-		if !isNonSyncSample { // sample is IDR
-			// create a new GOP that starts from this sample.
-			// set sample duration to zero
-			w.curTrack.samples = w.curTrack.samples[:0]
-			w.curTrack.samples = append(w.curTrack.samples, &fmp4.Sample{
-				IsNonSyncSample: isNonSyncSample,
-				Payload:         pl,
-				PTSOffset:       ptsOffset,
-			})
-		} else { // sample is not IDR
-			// append sample to current GOP
-			// set sample duration to zero
-			w.curTrack.samples = append(w.curTrack.samples, &fmp4.Sample{
-				IsNonSyncSample: isNonSyncSample,
-				Payload:         pl,
-				PTSOffset:       ptsOffset,
-			})
 		}
 	}
 
@@ -124,7 +114,7 @@ func (w *muxerFMP4) writeSample(
 }
 
 func (w *muxerFMP4) writeFinalDTS(dts int64) {
-	if len(w.curTrack.samples) != 0 && w.curTrack.firstDTS >= 0 {
+	if len(w.curTrack.samples) != 0 && w.curTrack.firstDTSSet {
 		duration := max(dts-w.curTrack.lastDTS, 0)
 		w.curTrack.samples[len(w.curTrack.samples)-1].Duration = uint32(duration)
 	}
@@ -134,7 +124,7 @@ func (w *muxerFMP4) innerFlush(final bool) error {
 	var part fmp4.Part
 
 	for _, track := range w.tracks {
-		if track.firstDTS >= 0 && (len(track.samples) > 1 || (final && len(track.samples) != 0)) {
+		if track.hasVisibleSamples && (len(track.samples) > 1 || (final && len(track.samples) != 0)) {
 			// do not write the final sample
 			// in order to allow changing its duration to compensate NTP-DTS differences
 			var samples []*fmp4.Sample
@@ -153,6 +143,7 @@ func (w *muxerFMP4) innerFlush(final bool) error {
 			if !final {
 				track.samples = track.samples[len(track.samples)-1:]
 				track.firstDTS = track.lastDTS
+				track.firstVisibleDTS = track.lastDTS
 			}
 		}
 	}
