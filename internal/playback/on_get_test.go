@@ -531,10 +531,11 @@ func TestOnGet(t *testing.T) {
 							SequenceNumber: 0,
 							Tracks: []*fmp4.PartTrack{
 								{
-									ID: 1,
+									ID:       1,
+									BaseTime: ^uint64(89999),
 									Samples: []*fmp4.Sample{
 										{
-											Duration:  0,
+											Duration:  90000,
 											PTSOffset: 90000,
 											Payload:   []byte{3, 4},
 										},
@@ -755,10 +756,11 @@ func TestOnGetDifferentInit(t *testing.T) {
 			SequenceNumber: 0,
 			Tracks: []*fmp4.PartTrack{
 				{
-					ID: 1,
+					ID:       1,
+					BaseTime: ^uint64(89999),
 					Samples: []*fmp4.Sample{
 						{
-							Duration:  0,
+							Duration:  90000,
 							PTSOffset: 90000,
 							Payload:   []byte{3, 4},
 						},
@@ -1040,10 +1042,10 @@ func TestOnGetBetweenSegments(t *testing.T) {
 						Tracks: []*fmp4.PartTrack{
 							{
 								ID:       1,
-								BaseTime: 45000,
+								BaseTime: ^uint64(44999),
 								Samples: []*fmp4.Sample{
 									{
-										Duration: 0,
+										Duration: 90000,
 										Payload:  []byte{1, 2},
 									},
 									{
