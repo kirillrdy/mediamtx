@@ -22,8 +22,10 @@ import (
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/hooks"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/playback"
 	"github.com/bluenviron/mediamtx/internal/protocols/httpp"
 	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
+	"github.com/bluenviron/mediamtx/internal/recordstore"
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
@@ -134,6 +136,28 @@ func (s *session) runInner2() (int, error) {
 	if s.req.publish {
 		return s.runPublish()
 	}
+
+	// Check for playback query params
+	query := s.req.httpRequest.URL.Query()
+	if rawStart := query.Get("start"); rawStart != "" {
+		start, err := time.Parse(time.RFC3339, rawStart)
+		if err != nil {
+			return http.StatusBadRequest, fmt.Errorf("invalid start: %w", err)
+		}
+
+		rawDuration := query.Get("duration")
+		if rawDuration == "" {
+			return http.StatusBadRequest, fmt.Errorf("duration parameter is required for playback")
+		}
+
+		duration, err := time.ParseDuration(rawDuration)
+		if err != nil {
+			return http.StatusBadRequest, fmt.Errorf("invalid duration: %w", err)
+		}
+
+		return s.runReadPlayback(start, duration)
+	}
+
 	return s.runRead()
 }
 
@@ -398,6 +422,185 @@ func (s *session) runRead() (int, error) {
 
 	case err = <-r.Error():
 		return 0, err
+
+	case <-s.ctx.Done():
+		return 0, fmt.Errorf("terminated")
+	}
+}
+
+func (s *session) runReadPlayback(start time.Time, duration time.Duration) (int, error) {
+	ip, _, _ := net.SplitHostPort(s.req.remoteAddr)
+
+	// Authenticate and get path config
+	res1, err := s.pathManager.FindPathConf(defs.PathFindPathConfReq{
+		AccessRequest: defs.PathAccessRequest{
+			Name:        s.req.pathName,
+			Query:       s.req.httpRequest.URL.RawQuery,
+			Proto:       auth.ProtocolWebRTC,
+			ID:          &s.uuid,
+			Credentials: httpp.Credentials(s.req.httpRequest),
+			IP:          net.ParseIP(ip),
+		},
+	})
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+
+	s.mutex.Lock()
+	s.user = res1.User
+	s.mutex.Unlock()
+
+	// Find recording segments
+	end := start.Add(duration)
+	segments, err := recordstore.FindSegments(res1.Conf, s.req.pathName, &start, &end)
+	if err != nil {
+		if errors.Is(err, recordstore.ErrNoSegmentsFound) {
+			return http.StatusNotFound, err
+		}
+		return http.StatusBadRequest, err
+	}
+
+	// Read init and create description from recorded segments
+	init, desc, err := playback.PreparePlayback(segments)
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+
+	// Create a stream for playback
+	str := &stream.Stream{
+		Desc:              desc,
+		WriteQueueSize:    512,
+		RTPMaxPayloadSize: 1200,
+		ReplaceNTP:        false,
+		Parent:            s,
+	}
+	err = str.Initialize()
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	defer str.Close()
+
+	// Set up ICE servers and peer connection
+	iceServers, err := s.parent.generateICEServers(false)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+
+	pc := &webrtc.PeerConnection{
+		UDPReadBufferSize:     s.udpReadBufferSize,
+		ICEUDPMux:             s.iceUDPMux,
+		ICETCPMux:             s.iceTCPMux,
+		ICEServers:            iceServers,
+		IPsFromInterfaces:     s.ipsFromInterfaces,
+		IPsFromInterfacesList: s.ipsFromInterfacesList,
+		AdditionalHosts:       s.additionalHosts,
+		STUNGatherTimeout:     time.Duration(s.stunGatherTimeout),
+		Publish:               true,
+		Log:                   s,
+	}
+
+	// Create reader and set up WebRTC tracks from the recorded description
+	r := &stream.Reader{Parent: s}
+
+	err = webrtc.FromStream(desc, r, pc)
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+
+	err = pc.Start()
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+
+	terminatorDone := make(chan struct{})
+	defer func() { <-terminatorDone }()
+
+	terminatorRun := make(chan struct{})
+	defer close(terminatorRun)
+
+	go func() {
+		defer close(terminatorDone)
+		select {
+		case <-s.ctx.Done():
+		case <-terminatorRun:
+		}
+		pc.Close()
+	}()
+
+	offer := whipOffer(s.req.offer)
+
+	answer, err := pc.CreateFullAnswer(offer)
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+
+	s.writeAnswer(answer)
+
+	go s.readRemoteCandidates(pc)
+
+	err = pc.WaitUntilConnected(time.Duration(s.handshakeTimeout))
+	if err != nil {
+		return 0, err
+	}
+
+	s.mutex.Lock()
+	s.pc = pc
+	s.mutex.Unlock()
+
+	s.Log(logger.Info, "is playing back path '%s' from %s for %s, %s",
+		s.req.pathName, start.Format(time.RFC3339), duration, defs.FormatsInfo(r.Formats()))
+
+	// Add reader to stream (starts the ring buffer goroutine)
+	str.AddReader(r)
+	defer str.RemoveReader(r)
+
+	s.mutex.Lock()
+	s.reader = r
+	s.mutex.Unlock()
+
+	// Create SubStream for pushing playback data
+	ss := &stream.SubStream{
+		Stream:        str,
+		UseRTPPackets: false,
+	}
+	err = ss.Initialize()
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+
+	// Start playback in a goroutine
+	playbackDone := make(chan error, 1)
+	go func() {
+		playbackDone <- playback.StreamPlaybackToSubStream(
+			s.ctx,
+			res1.Conf.RecordFormat,
+			segments,
+			start,
+			duration,
+			desc,
+			ss,
+			init,
+		)
+	}()
+
+	select {
+	case <-pc.Failed():
+		return 0, fmt.Errorf("peer connection closed")
+
+	case err = <-r.Error():
+		return 0, err
+
+	case err = <-playbackDone:
+		if err != nil {
+			return 0, err
+		}
+		// Playback finished. Wait briefly for buffers to drain.
+		select {
+		case <-time.After(2 * time.Second):
+		case <-pc.Failed():
+		case <-s.ctx.Done():
+		}
+		return 0, nil
 
 	case <-s.ctx.Done():
 		return 0, fmt.Errorf("terminated")
