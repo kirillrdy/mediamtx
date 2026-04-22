@@ -104,14 +104,15 @@ func urlScheme(ctx *gin.Context, trustedProxies conf.IPNetworks, encryption bool
 }
 
 type listEntry struct {
-	Start    time.Time         `json:"start"`
-	Duration listEntryDuration `json:"duration"`
-	Width    int               `json:"width,omitempty"`
-	Height   int               `json:"height,omitempty"`
-	URL      string            `json:"url"`
+	Start     time.Time         `json:"start"`
+	Duration  listEntryDuration `json:"duration"`
+	Width     int               `json:"width,omitempty"`
+	Height    int               `json:"height,omitempty"`
+	Framerate float64           `json:"framerate,omitempty"`
+	URL       string            `json:"url"`
 }
 
-func videoResolution(init *fmp4.Init) (int, int) {
+func videoProperties(init *fmp4.Init) (width, height int, framerate float64) {
 	for _, track := range init.Tracks {
 		if !track.Codec.IsVideo() {
 			continue
@@ -121,30 +122,30 @@ func videoResolution(init *fmp4.Init) (int, int) {
 		case *codecs.H264:
 			var sps h264.SPS
 			if err := sps.Unmarshal(codec.SPS); err == nil {
-				return sps.Width(), sps.Height()
+				return sps.Width(), sps.Height(), sps.FPS()
 			}
 
 		case *codecs.H265:
 			var sps h265.SPS
 			if err := sps.Unmarshal(codec.SPS); err == nil {
-				return sps.Width(), sps.Height()
+				return sps.Width(), sps.Height(), sps.FPS()
 			}
 
 		case *codecs.AV1:
 			var sh av1.SequenceHeader
 			if err := sh.Unmarshal(codec.SequenceHeader); err == nil {
-				return sh.Width(), sh.Height()
+				return sh.Width(), sh.Height(), 0
 			}
 
 		case *codecs.VP9:
-			return codec.Width, codec.Height
+			return codec.Width, codec.Height, 0
 
 		case *codecs.MJPEG:
-			return codec.Width, codec.Height
+			return codec.Width, codec.Height, 0
 		}
 	}
 
-	return 0, 0
+	return 0, 0, 0
 }
 
 func concatenateSegments(parsed []*parsedSegment) []listEntry {
@@ -161,12 +162,13 @@ func concatenateSegments(parsed []*parsedSegment) []listEntry {
 			curEnd := parsed.start.Add(parsed.duration)
 			out[len(out)-1].Duration = listEntryDuration(curEnd.Sub(prevStart))
 		} else {
-			w, h := videoResolution(parsed.init)
+			w, h, fps := videoProperties(parsed.init)
 			out = append(out, listEntry{
-				Start:    parsed.start,
-				Duration: listEntryDuration(parsed.duration),
-				Width:    w,
-				Height:   h,
+				Start:     parsed.start,
+				Duration:  listEntryDuration(parsed.duration),
+				Width:     w,
+				Height:    h,
+				Framerate: fps,
 			})
 		}
 
